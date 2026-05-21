@@ -1,0 +1,9 @@
+{
+	"id": "smart-graph-grouping",
+	"name": "Smart Graph Grouping",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Automatically assigns mixed colors to graph nodes based on thematic clusters and network connectivity.",
+	"author": "Tu",
+	"isDesktopOnly": false
+}
