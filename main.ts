@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, TFile, setIcon } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, TFile, setIcon, MarkdownView } from 'obsidian';
 
 // ---------------------------------------------------------
 // 1. DATA STRUCTURES & SETTINGS
@@ -40,33 +40,38 @@ interface GraphClusterSettings {
 	fontSizeMax: number;
 	linkWidthBase: number;
 	linkWidthHover: number;
+
+	showLocalGraphInEditor: boolean;
+	localGraphHeight: number;
 }
 
-// VALORI DI DEFAULT RICALIBRATI PER UNA RESA PROFESSIONALE "OUT OF THE BOX"
+// Impostazioni aggiornate in base alle specifiche fornite (graph_config.json)
 const DEFAULT_SETTINGS: GraphClusterSettings = {
 	clusters: [],
 	nodeColors: {},
 	nodePrimaryClusters: {},
 	absoluteCenters: [],
-	repulsionForce: 200,    // Leggermente aumentata per contrastare la nuova gravità
-	linkDistance: 50,       // Molle più corte per compattare i cluster
-	linkStrength: 0.04,     // Molle più rigide
-	centerGravity: 0.1,    // Raddoppiata la gravità per evitare l'effetto "galassia esplosa"
+	repulsionForce: 200, 
+	linkDistance: 115,
+	linkStrength: 0.038,
+	centerGravity: 0.1,
 	showAllLabels: false,
 	whiteLabels: false,
 	hoverLinkColor: "var(--color-purple)", 
-	labelVisibilityThreshold: 0.4,
-	absoluteCenterDistance: 120, // Macroargomenti più vicini al nucleo assoluto
+	labelVisibilityThreshold: 0,
+	absoluteCenterDistance: 10,
 	spawnAnimation: 'radial',
 	enableColors: true,
 	enableGlow: true,
 	glowIntensity: 1.0,
-	nodeMinRadius: 6,       // Nodi di base più leggibili
-	nodeMaxRadius: 35,      // Nodi grandi più evidenti
-	fontSizeMin: 14,        // Testo di base ingrandito
-	fontSizeMax: 18,        // Testo massimo ingrandito
-	linkWidthBase: 1,     // Linee base più visibili
-	linkWidthHover: 2.5     // Linee hover più marcate
+	nodeMinRadius: 6,
+	nodeMaxRadius: 35,
+	fontSizeMin: 12,
+	fontSizeMax: 18,
+	linkWidthBase: 1.0,
+	linkWidthHover: 2.0,
+	showLocalGraphInEditor: false, 
+	localGraphHeight: 250
 }
 
 // ---------------------------------------------------------
@@ -101,20 +106,28 @@ export default class SmartGraphPlugin extends Plugin {
 			name: 'Open Smart Graph',
 			callback: () => this.activateView()
 		});
+
+		this.registerEvent(
+			this.app.workspace.on('file-open', (file) => {
+				this.updateAllLocalGraphs();
+			})
+		);
 	}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	async saveSettings() {
+	async saveSettings(refreshGraphs = true) {
 		await this.saveData(this.settings);
-		const leaves = this.app.workspace.getLeavesOfType(SMART_GRAPH_VIEW_TYPE);
-		if (leaves.length > 0) {
-			const view = leaves[0].view as SmartGraphView;
-			view.textCache.clear(); 
-			view.wakeUp(); 
-			view.drawGraph(); 
+		if (refreshGraphs) {
+			const leaves = this.app.workspace.getLeavesOfType(SMART_GRAPH_VIEW_TYPE);
+			if (leaves.length > 0) {
+				const view = leaves[0].view as SmartGraphView;
+				view.textCache.clear(); 
+				view.wakeUp(); 
+			}
+			this.updateAllLocalGraphs();
 		}
 	}
 
@@ -138,7 +151,43 @@ export default class SmartGraphPlugin extends Plugin {
 	}
 
 	// ---------------------------------------------------------
-	// 3. LOGIC ENGINE (Community Detection & Absolute Centers)
+	// 3. GESTIONE GRAFI LOCALI NELL'EDITOR (BANNER INJECTION)
+	// ---------------------------------------------------------
+	updateAllLocalGraphs() {
+		const markdownLeaves = this.app.workspace.getLeavesOfType("markdown");
+		
+		markdownLeaves.forEach(leaf => {
+			const view = leaf.view as MarkdownView;
+			const file = view.file;
+			const contentEl = view.contentEl;
+
+			let wrapper = contentEl.querySelector('.smart-local-graph-wrapper') as HTMLElement;
+
+			if (!this.settings.showLocalGraphInEditor || !file) {
+				if (wrapper) wrapper.remove();
+				return;
+			}
+
+			if (!wrapper) {
+				wrapper = document.createElement('div');
+				wrapper.className = 'smart-local-graph-wrapper';
+				wrapper.style.width = '100%';
+				wrapper.style.flexShrink = '0'; 
+				wrapper.style.borderBottom = '1px solid var(--background-modifier-border)';
+				wrapper.style.position = 'relative';
+				wrapper.style.overflow = 'hidden';
+				contentEl.insertBefore(wrapper, contentEl.firstChild);
+			}
+			
+			wrapper.style.height = `${this.settings.localGraphHeight}px`;
+			wrapper.empty(); 
+
+			new SmartLocalGraphRenderer(wrapper, file, this);
+		});
+	}
+
+	// ---------------------------------------------------------
+	// 4. LOGIC ENGINE (Community Detection & Absolute Centers)
 	// ---------------------------------------------------------
 
 	async runClusterAnalysis() {
@@ -150,9 +199,20 @@ export default class SmartGraphPlugin extends Plugin {
 			return;
 		}
 
-		const hubPaths = this.identifyHubsViaCommunities(graph);
+		let hubPaths = this.identifyHubsViaCommunities(graph);
+		
+		// Fallback di Sicurezza: se l'algoritmo non trova hub per frammentazione rete
 		if (hubPaths.length === 0) {
-			new Notice("Not enough connected notes to identify thematic hubs.");
+			console.log("Community detection failed. Falling back to degree centrality.");
+			hubPaths = Array.from(graph.entries())
+				.sort((a, b) => b[1].size - a[1].size)
+				.slice(0, 6)
+				.filter(entry => entry[1].size > 0)
+				.map(entry => entry[0]);
+		}
+
+		if (hubPaths.length === 0) {
+			new Notice("Non ci sono abbastanza collegamenti nel Vault per creare dei gruppi.");
 			return;
 		}
 
@@ -188,12 +248,12 @@ export default class SmartGraphPlugin extends Plugin {
 
 		this.updateClusters(hubPaths, graph);
 		this.calculateNodeColors(graph);
-		await this.saveSettings();
+		await this.saveSettings(false); // Salva senza triggherare wakeUp base
 
 		const leaves = this.app.workspace.getLeavesOfType(SMART_GRAPH_VIEW_TYPE);
 		if (leaves.length > 0) {
 			const view = leaves[0].view as SmartGraphView;
-			view.reloadFullGraph();
+			view.hardReset(); // Forza ricaricamento totale nodi e ricalcolo colori
 		}
 
 		new Notice(`Analysis complete! Detected ${hubPaths.length} macro-groups and ${finalCenters.length} absolute centers.`);
@@ -441,7 +501,7 @@ export default class SmartGraphPlugin extends Plugin {
 }
 
 // ---------------------------------------------------------
-// 4. SETTINGS PANEL 
+// 5. SETTINGS PANEL 
 // ---------------------------------------------------------
 
 class SmartGraphSettingTab extends PluginSettingTab {
@@ -456,9 +516,33 @@ class SmartGraphSettingTab extends PluginSettingTab {
 		const {containerEl} = this;
 		containerEl.empty();
 
-		containerEl.createEl('h3', { text: 'Cluster Colors Management' });
-		containerEl.createEl('p', { text: 'Macro groups are detected automatically. Use the floating menu within the graph view to modify physics and display options.', cls: 'setting-item-description' });
+		containerEl.createEl('h3', { text: 'Smart Graph Settings' });
+		containerEl.createEl('p', { text: 'Use the floating menu inside the main graph for live tuning. Settings here apply globally.', cls: 'setting-item-description' });
 
+		new Setting(containerEl)
+			.setName('Enable Local Graph in Editor')
+			.setDesc('Mostra automaticamente un mini-grafo interattivo in cima ad ogni nota, centrato su di essa.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.showLocalGraphInEditor)
+				.onChange(async (value) => {
+					this.plugin.settings.showLocalGraphInEditor = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Local Graph Height')
+			.setDesc('Altezza (in pixel) della fascia del mini-grafo all\'interno della nota.')
+			.addSlider(slider => slider
+				.setLimits(100, 500, 10)
+				.setValue(this.plugin.settings.localGraphHeight)
+				.setDynamicTooltip()
+				.onChange(async (value) => {
+					this.plugin.settings.localGraphHeight = value;
+					await this.plugin.saveSettings();
+				}));
+
+		containerEl.createEl('h3', { text: 'Cluster Colors Management' });
+		
 		for (const cluster of this.plugin.settings.clusters) {
 			new Setting(containerEl)
 				.setName(`Group: ${cluster.name}`)
@@ -476,23 +560,28 @@ class SmartGraphSettingTab extends PluginSettingTab {
 }
 
 // ---------------------------------------------------------
-// 5. CUSTOM VIEW & GRAPH CONSTANTS
+// 6. CUSTOM VIEW & GRAPH CONSTANTS
 // ---------------------------------------------------------
 
 const GRAPH_CONSTANTS = {
 	PHYSICS: {
-		FRICTION: 0.30, 
+		FRICTION_ACTIVE: 0.70,     
+		FRICTION_IDLE: 0.10,       
+		ENERGY_DECAY: 0.96,        
 		MAX_VELOCITY: 45,
 		LERP_SPEED: 0.12,
 		MIN_DIST_SQ: 100,
 		MAX_FORCE: 50,
 		GRAVITY_PLATEAU: 800,
-		SLEEP_VELOCITY_THRESHOLD: 0.02, 
+		SLEEP_VELOCITY_THRESHOLD: 0.05, 
 		SLEEP_FRAME_THRESHOLD: 30,
 		WAVE_DURATION_FRAMES: 90,
-		SPAWN_AREA: 1000 // Ristretta l'area di partenza per limitare dispersioni enormi iniziali
+		SPAWN_AREA: 1000 
 	},
 	VISUALS: {
+		NODE_HUB_RADIUS: 12,
+		NODE_CENTER_RADIUS: 30,
+		FONT_SIZE_CENTER: 15,
 		TEXT_PADDING: 8,
 		OPACITY_UNFOCUSED_NODE: 0.35, 
 		OPACITY_UNFOCUSED_LINK: 0.05, 
@@ -582,6 +671,7 @@ class SmartGraphView extends ItemView {
 
 	isSleeping: boolean = false;
 	stableFrames: number = 0;
+	energy: number = 1.0; 
 	
 	isFullySpawned: boolean = false; 
 
@@ -664,6 +754,7 @@ class SmartGraphView extends ItemView {
 			this.targetTransform.y = mouseY - (mouseY - this.targetTransform.y) * (newScale / this.targetTransform.k);
 			this.targetTransform.k = newScale;
 			
+			this.wakeUp();
 			this.drawGraph();
 		});
 
@@ -712,6 +803,7 @@ class SmartGraphView extends ItemView {
 				this.transform.y = e.clientY - this.dragStartY;
 				this.targetTransform.x = this.transform.x;
 				this.targetTransform.y = this.transform.y;
+				this.wakeUp();
 				this.drawGraph();
 			} else {
 				const pos = getMousePos(e);
@@ -731,6 +823,7 @@ class SmartGraphView extends ItemView {
 				if (foundHover !== this.hoveredNode) {
 					this.hoveredNode = foundHover;
 					this.canvas.style.cursor = this.hoveredNode ? 'pointer' : 'grab';
+					this.wakeUp();
 					this.drawGraph();
 				}
 			}
@@ -776,20 +869,30 @@ class SmartGraphView extends ItemView {
 	}
 
 	wakeUp() {
-		if (this.isSleeping) {
+		if (this.isSleeping || this.energy < 1.0) {
 			this.isSleeping = false;
 			this.stableFrames = 0;
+			this.energy = 1.0;
 		}
 	}
 
-	reloadFullGraph() {
+	// Metodo per forzare la ricarica pulita e il riavvio completo dell'animazione
+	hardReset() {
+		this.currentFrame = 0;
+		this.isFullySpawned = false;
+		this.energy = 1.0;
+		this.isSleeping = false;
+		this.stableFrames = 0;
+		if(this.ctx) this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 		this.initPhysicsData();
-		this.drawGraph();
+	}
+
+	reloadFullGraph() {
+		this.hardReset();
 	}
 
 	updateNodeRadii() {
 		for (const node of this.nodes) {
-			// Usiamo un moltiplicatore più incisivo di default (3.5) per evidenziare le proporzioni
 			let calculatedRadius = this.plugin.settings.nodeMinRadius + (Math.sqrt(node.degree) * 3.5);
 			if (node.isHub) calculatedRadius = Math.max(calculatedRadius, this.plugin.settings.nodeMaxRadius * 0.7);
 			
@@ -1115,93 +1218,105 @@ class SmartGraphView extends ItemView {
 			
 			createSelect(displaySection, 'Spawn Animation', { radial: 'Radial Burst', hierarchical: 'Hierarchical Wave' }, this.plugin.settings.spawnAnimation, async (val) => {
 				this.plugin.settings.spawnAnimation = val as 'hierarchical' | 'radial';
-				await this.plugin.saveSettings();
-				this.reloadFullGraph(); 
+				await this.plugin.saveSettings(false); // Salva senza refresh standard
+				this.hardReset(); // Usa il nostro Hard Reset per resettare completamente fisica e visiva
 			});
 
 			createSlider(displaySection, 'Label Visibility Threshold', 0, 3, 0.1, this.plugin.settings.labelVisibilityThreshold, async (val) => {
 				this.plugin.settings.labelVisibilityThreshold = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createToggle(displaySection, 'Force all labels visible', this.plugin.settings.showAllLabels, async (val) => {
 				this.plugin.settings.showAllLabels = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createToggle(displaySection, 'High contrast labels (White)', this.plugin.settings.whiteLabels, async (val) => {
 				this.plugin.settings.whiteLabels = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createTextInput(displaySection, 'Hover Link Color', 'e.g., var(--color-purple)', this.plugin.settings.hoverLinkColor, async (val) => {
 				this.plugin.settings.hoverLinkColor = val || "var(--color-purple)";
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.updateResolvedColor(); 
 				this.drawGraph();
+			});
+
+			// SEZIONE LOCAL GRAPH
+			const localGraphSection = createSection('Editor Local Graph', false);
+			createToggle(localGraphSection, 'Enable Local Graph', this.plugin.settings.showLocalGraphInEditor, async (val) => {
+				this.plugin.settings.showLocalGraphInEditor = val;
+				await this.plugin.saveSettings(false); 
+				this.plugin.updateAllLocalGraphs();
+			});
+			createSlider(localGraphSection, 'Graph Height (px)', 100, 500, 10, this.plugin.settings.localGraphHeight, async (val) => {
+				this.plugin.settings.localGraphHeight = val;
+				await this.plugin.saveSettings(false);
+				this.plugin.updateAllLocalGraphs();
 			});
 
 			const appearanceSection = createSection('Appearance', false);
 
 			createToggle(appearanceSection, 'Enable Node Colors', this.plugin.settings.enableColors, async (val) => {
 				this.plugin.settings.enableColors = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createToggle(appearanceSection, 'Enable Glow Effects', this.plugin.settings.enableGlow, async (val) => {
 				this.plugin.settings.enableGlow = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createSlider(appearanceSection, 'Glow Intensity', 0.1, 3.0, 0.1, this.plugin.settings.glowIntensity, async (val) => {
 				this.plugin.settings.glowIntensity = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createSlider(appearanceSection, 'Node Min Size', 1, 10, 1, this.plugin.settings.nodeMinRadius, async (val) => {
 				this.plugin.settings.nodeMinRadius = val;
 				this.updateNodeRadii();
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 			});
 
 			createSlider(appearanceSection, 'Node Max Size', 10, 50, 1, this.plugin.settings.nodeMaxRadius, async (val) => {
 				this.plugin.settings.nodeMaxRadius = val;
 				this.updateNodeRadii();
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 			});
 
 			createSlider(appearanceSection, 'Font Size Base', 6, 24, 1, this.plugin.settings.fontSizeMin, async (val) => {
 				this.plugin.settings.fontSizeMin = val;
 				this.textCache.clear();
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createSlider(appearanceSection, 'Font Size Max', 10, 36, 1, this.plugin.settings.fontSizeMax, async (val) => {
 				this.plugin.settings.fontSizeMax = val;
 				this.textCache.clear();
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createSlider(appearanceSection, 'Link Base Thickness', 0.1, 3.0, 0.1, this.plugin.settings.linkWidthBase, async (val) => {
 				this.plugin.settings.linkWidthBase = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
 
 			createSlider(appearanceSection, 'Link Hover Thickness', 0.5, 5.0, 0.1, this.plugin.settings.linkWidthHover, async (val) => {
 				this.plugin.settings.linkWidthHover = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.drawGraph();
 			});
-
 
 			const groupSection = createSection('Groups', false);
 			
@@ -1248,7 +1363,8 @@ class SmartGraphView extends ItemView {
 						n.color = this.plugin.settings.nodeColors[n.id] || "#888888";
 					}
 					
-					await this.plugin.saveSettings();
+					await this.plugin.saveSettings(false);
+					this.drawGraph();
 				});
 			}
 
@@ -1266,31 +1382,31 @@ class SmartGraphView extends ItemView {
 
 			createSlider(forceSection, 'Repel Force', 0, 15000, 100, this.plugin.settings.repulsionForce, async (val) => {
 				this.plugin.settings.repulsionForce = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.wakeUp();
 			});
 
 			createSlider(forceSection, 'Hub to Center Distance', 10, 2000, 10, this.plugin.settings.absoluteCenterDistance, async (val) => {
 				this.plugin.settings.absoluteCenterDistance = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.wakeUp();
 			});
 
 			createSlider(forceSection, 'Link Distance', 10, 500, 5, this.plugin.settings.linkDistance, async (val) => {
 				this.plugin.settings.linkDistance = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.wakeUp();
 			});
 
 			createSlider(forceSection, 'Link Force', 0.001, 0.2, 0.001, this.plugin.settings.linkStrength, async (val) => {
 				this.plugin.settings.linkStrength = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.wakeUp();
 			});
 			
 			createSlider(forceSection, 'Center Gravity', 0.001, 0.1, 0.001, this.plugin.settings.centerGravity, async (val) => {
 				this.plugin.settings.centerGravity = val;
-				await this.plugin.saveSettings();
+				await this.plugin.saveSettings(false);
 				this.wakeUp();
 			});
 		};
@@ -1300,54 +1416,57 @@ class SmartGraphView extends ItemView {
 		resetBtn.addEventListener('click', async (e) => {
 			e.stopPropagation();
 			
-			// Reimposta le impostazioni con i nuovi default ottimizzati
+			// Reimposta le impostazioni coerentemente con graph_config.json
 			this.plugin.settings.spawnAnimation = 'radial';
 			this.plugin.settings.repulsionForce = 200;
-			this.plugin.settings.linkDistance = 50;
-			this.plugin.settings.linkStrength = 0.04;
+			this.plugin.settings.linkDistance = 115;
+			this.plugin.settings.linkStrength = 0.038;
 			this.plugin.settings.centerGravity = 0.1;
 			this.plugin.settings.showAllLabels = false;
 			this.plugin.settings.whiteLabels = false;
 			this.plugin.settings.hoverLinkColor = "var(--color-purple)";
-			this.plugin.settings.labelVisibilityThreshold = 0.4;
-			this.plugin.settings.absoluteCenterDistance = 120;
+			this.plugin.settings.labelVisibilityThreshold = 0;
+			this.plugin.settings.absoluteCenterDistance = 10;
 			this.plugin.settings.enableColors = true;
 			this.plugin.settings.enableGlow = true;
 			this.plugin.settings.glowIntensity = 1.0;
 			this.plugin.settings.nodeMinRadius = 6;
 			this.plugin.settings.nodeMaxRadius = 35;
-			this.plugin.settings.fontSizeMin = 14;
+			this.plugin.settings.fontSizeMin = 12;
 			this.plugin.settings.fontSizeMax = 18;
-			this.plugin.settings.linkWidthBase = 1;
-			this.plugin.settings.linkWidthHover = 2.5;
+			this.plugin.settings.linkWidthBase = 1.0;
+			this.plugin.settings.linkWidthHover = 2.0;
 
-			await this.plugin.saveSettings();
+			await this.plugin.saveSettings(false);
 			this.updateResolvedColor();
 			this.updateNodeRadii();
 			
 			renderControls();
-			this.wakeUp();
-			this.drawGraph();
+			this.hardReset();
 		});
 
 		uiPanel.addEventListener('mousedown', (e) => e.stopPropagation());
 		uiPanel.addEventListener('wheel', (e) => e.stopPropagation());
 	}
 
-	stepPhysics(): number {
+	stepPhysics(isPrecalc: boolean = false): number {
 		const repulsionConstant = this.plugin.settings.repulsionForce; 
 		const baseSpringConstant = this.plugin.settings.linkStrength;
 		const baseSpringLength = this.plugin.settings.linkDistance;
 		const absCenterDistance = this.plugin.settings.absoluteCenterDistance;
 		const gravity = this.plugin.settings.centerGravity;
 
+		const currentFriction = isPrecalc 
+			? 0.25 
+			: GRAPH_CONSTANTS.PHYSICS.FRICTION_IDLE + (GRAPH_CONSTANTS.PHYSICS.FRICTION_ACTIVE - GRAPH_CONSTANTS.PHYSICS.FRICTION_IDLE) * this.energy;
+
 		for (let i = 0; i < this.nodes.length; i++) {
 			const n1 = this.nodes[i];
-			if (!n1.isActive) continue; 
+			if (!n1.isActive && !isPrecalc) continue; 
 			
 			for (let j = i + 1; j < this.nodes.length; j++) {
 				const n2 = this.nodes[j];
-				if (!n2.isActive) continue; 
+				if (!n2.isActive && !isPrecalc) continue; 
 
 				const dx = n1.x - n2.x;
 				const dy = n1.y - n2.y;
@@ -1367,7 +1486,7 @@ class SmartGraphView extends ItemView {
 		for (const edge of this.edges) {
 			const n1 = this.nodes[edge.sourceIndex];
 			const n2 = this.nodes[edge.targetIndex];
-			if (!n1.isActive || !n2.isActive) continue; 
+			if ((!n1.isActive || !n2.isActive) && !isPrecalc) continue; 
 			
 			const dx = n2.x - n1.x;
 			const dy = n2.y - n1.y;
@@ -1399,7 +1518,7 @@ class SmartGraphView extends ItemView {
 		let totalVelocity = 0; 
 		
 		for (const node of this.nodes) {
-			if (!node.isActive) continue;
+			if (!node.isActive && !isPrecalc) continue;
 			if (node === this.draggedNode) continue; 
 
 			const distSq = node.x * node.x + node.y * node.y;
@@ -1417,8 +1536,8 @@ class SmartGraphView extends ItemView {
 				node.vy = (node.vy / speed) * GRAPH_CONSTANTS.PHYSICS.MAX_VELOCITY;
 			}
 
-			node.vx *= GRAPH_CONSTANTS.PHYSICS.FRICTION;
-			node.vy *= GRAPH_CONSTANTS.PHYSICS.FRICTION;
+			node.vx *= currentFriction;
+			node.vy *= currentFriction;
 
 			if (Math.abs(node.vx) < GRAPH_CONSTANTS.PHYSICS.SLEEP_VELOCITY_THRESHOLD) node.vx = 0;
 			if (Math.abs(node.vy) < GRAPH_CONSTANTS.PHYSICS.SLEEP_VELOCITY_THRESHOLD) node.vy = 0;
@@ -1434,8 +1553,6 @@ class SmartGraphView extends ItemView {
 	initPhysicsData() {
 		this.nodes = [];
 		this.edges = [];
-		this.currentFrame = 0; 
-		this.isFullySpawned = false; 
 		
 		const graphMap = this.plugin.buildBidirectionalGraph();
 		const nodeIndexMap = new Map<string, number>();
@@ -1478,7 +1595,6 @@ class SmartGraphView extends ItemView {
 			const primaryClusterId = primaryClusters[path] || "";
 			const primaryColor = primaryClusterId ? hubMap.get(primaryClusterId)?.color : undefined;
 			
-			// Calcolo logico scalato sui nuovi parametri
 			let calculatedRadius = this.plugin.settings.nodeMinRadius + (Math.sqrt(degree) * 3.5);
 			if (isHub) calculatedRadius = Math.max(calculatedRadius, this.plugin.settings.nodeMaxRadius * 0.7);
 			
@@ -1571,7 +1687,7 @@ class SmartGraphView extends ItemView {
 		if (isRadial) {
 			for (const node of this.nodes) node.isActive = true; 
 			for (let i = 0; i < 200; i++) {
-				this.stepPhysics(); 
+				this.stepPhysics(true); 
 			}
 
 			for (const node of this.nodes) {
@@ -1643,22 +1759,32 @@ class SmartGraphView extends ItemView {
 			}
 		} 
 		else {
-			totalVelocity = this.stepPhysics(); 
+			totalVelocity = this.stepPhysics(false); 
 		}
 
 		const averageVelocity = activeNodesCount > 0 ? totalVelocity / activeNodesCount : 0;
 
 		if (this.isFullySpawned && averageVelocity < GRAPH_CONSTANTS.PHYSICS.SLEEP_VELOCITY_THRESHOLD) { 
-			this.stableFrames++;
-			if (this.stableFrames > GRAPH_CONSTANTS.PHYSICS.SLEEP_FRAME_THRESHOLD) { 
-				this.isSleeping = true;
-				for (const node of this.nodes) {
-					node.vx = 0;
-					node.vy = 0;
+			this.energy *= GRAPH_CONSTANTS.PHYSICS.ENERGY_DECAY;
+			
+			if (this.energy < 0.05) {
+				this.stableFrames++;
+				if (this.stableFrames > GRAPH_CONSTANTS.PHYSICS.SLEEP_FRAME_THRESHOLD) { 
+					this.isSleeping = true;
+					this.energy = 0;
+					for (const node of this.nodes) {
+						node.vx = 0;
+						node.vy = 0;
+					}
 				}
 			}
 		} else {
 			this.stableFrames = 0;
+			if (this.draggedNode) {
+				this.energy = 1.0;
+			} else {
+				this.energy = Math.min(1.0, this.energy + 0.05);
+			}
 		}
 	}
 
@@ -1943,7 +2069,6 @@ class SmartGraphView extends ItemView {
 					fillStyle = this.resolveCSSColor(GRAPH_CONSTANTS.COLORS.TEXT_DEFAULT_VAR, GRAPH_CONSTANTS.COLORS.TEXT_FALLBACK);
 				}
 
-				// Calcolo coerente dei font in base alle impostazioni personalizzate
 				let baseFontSize = node.isAbsoluteCenter 
 					? (this.plugin.settings.fontSizeMax + 2) 
 					: Math.max(this.plugin.settings.fontSizeMin, Math.min(this.plugin.settings.fontSizeMax, node.radius)); 
@@ -1989,6 +2114,453 @@ class SmartGraphView extends ItemView {
 
 		if (this.hoveredNode) {
 			renderNode(this.hoveredNode, true, false);
+		}
+
+		this.ctx.restore();
+	}
+}
+
+// ---------------------------------------------------------
+// 7. LOCAL GRAPH RENDERER (EDITOR BANNER)
+// ---------------------------------------------------------
+
+class SmartLocalGraphRenderer {
+	container: HTMLElement;
+	file: TFile;
+	plugin: SmartGraphPlugin;
+	canvas: HTMLCanvasElement;
+	ctx: CanvasRenderingContext2D;
+	animationFrameId: number = 0;
+	
+	nodes: any[] = [];
+	edges: any[] = [];
+
+	transform = { x: 0, y: 0, k: 1 };
+	targetTransform = { x: 0, y: 0, k: 1 };
+
+	isDragging = false;
+	dragStartX = 0;
+	dragStartY = 0;
+	rawDragStartX = 0;
+	rawDragStartY = 0;
+	draggedNode: any = null;
+	hoveredNode: any = null; 
+
+	isSleeping: boolean = false;
+	stableFrames: number = 0;
+	energy: number = 1.0; 
+
+	constructor(container: HTMLElement, file: TFile, plugin: SmartGraphPlugin) {
+		this.container = container;
+		this.file = file;
+		this.plugin = plugin;
+		
+		this.rawDragStartX = 0; // Inizializzazione esplicita per evitare alert TypeScript
+		this.rawDragStartY = 0;
+
+		this.canvas = document.createElement('canvas');
+		this.canvas.style.display = 'block';
+		this.canvas.style.width = '100%';
+		this.canvas.style.height = '100%';
+		this.canvas.style.backgroundColor = 'transparent';
+		this.container.appendChild(this.canvas);
+		
+		this.ctx = this.canvas.getContext('2d', { alpha: true })!;
+
+		const resizeObserver = new ResizeObserver(() => {
+			const dpr = window.devicePixelRatio || 1;
+			const rect = this.container.getBoundingClientRect();
+			
+			this.canvas.width = rect.width * dpr;
+			this.canvas.height = rect.height * dpr;
+
+			if (this.transform.x === 0 && this.transform.y === 0) {
+				this.transform.x = rect.width / 2;
+				this.transform.y = rect.height / 2;
+				this.transform.k = 1.0; 
+				this.targetTransform = { ...this.transform };
+			}
+			this.wakeUp();
+		});
+		resizeObserver.observe(this.container);
+
+		this.initData();
+		this.setupInteraction();
+		this.startSimulation();
+	}
+
+	initData() {
+		const graphMap = this.plugin.buildBidirectionalGraph();
+		const neighbors = graphMap.get(this.file.path) || new Set();
+		
+		const localNodesSet = new Set([this.file.path, ...neighbors]);
+		const nodeIndexMap = new Map<string, number>();
+
+		let maxDegreeLocal = 1;
+		for (const path of localNodesSet) {
+			const degree = (graphMap.get(path) || new Set()).size;
+			if (degree > maxDegreeLocal) maxDegreeLocal = degree;
+		}
+
+		for (const path of localNodesSet) {
+			const isCenter = path === this.file.path;
+			const color = this.plugin.settings.nodeColors[path] || GRAPH_CONSTANTS.COLORS.DEFAULT_NODE;
+			const name = path.split('/').pop()?.replace('.md', '') || path;
+			
+			const globalDegree = (graphMap.get(path) || new Set()).size;
+			
+			let radius = this.plugin.settings.nodeMinRadius + (Math.sqrt(globalDegree) * 3.5);
+			radius = Math.min(radius, this.plugin.settings.nodeMaxRadius * 0.8);
+			
+			if (isCenter) radius = this.plugin.settings.nodeMaxRadius * 1.0; 
+
+			this.nodes.push({
+				id: path,
+				name,
+				color,
+				radius,
+				x: isCenter ? 0 : (Math.random() - 0.5) * 200,
+				y: isCenter ? 0 : (Math.random() - 0.5) * 200,
+				vx: 0, vy: 0,
+				isCenter,
+				visualRadius: radius,
+				visualOpacity: 1.0,
+				visualGlow: isCenter ? 15 : 0,
+				visualTextOpacity: 1.0
+			});
+			nodeIndexMap.set(path, this.nodes.length - 1);
+		}
+
+		for (const path of localNodesSet) {
+			const sourceIndex = nodeIndexMap.get(path);
+			const pathNeighbors = graphMap.get(path) || new Set();
+			
+			for (const neighbor of pathNeighbors) {
+				if (localNodesSet.has(neighbor)) {
+					const targetIndex = nodeIndexMap.get(neighbor);
+					if (targetIndex !== undefined && sourceIndex! < targetIndex) {
+						this.edges.push({
+							sourceIndex,
+							targetIndex,
+							hoverProgress: 0,
+							visualOpacity: GRAPH_CONSTANTS.VISUALS.OPACITY_BASE_LINK,
+							visualWidth: this.plugin.settings.linkWidthBase
+						});
+					}
+				}
+			}
+		}
+	}
+
+	setupInteraction() {
+		const getMousePos = (e: MouseEvent) => {
+			const rect = this.canvas.getBoundingClientRect();
+			return {
+				x: (e.clientX - rect.left - this.targetTransform.x) / this.targetTransform.k,
+				y: (e.clientY - rect.top - this.targetTransform.y) / this.targetTransform.k
+			};
+		};
+
+		this.canvas.addEventListener('wheel', (e) => {
+			e.preventDefault();
+			const zoomSensitivity = 0.0012; 
+			const delta = -e.deltaY * zoomSensitivity;
+			const newScale = Math.max(0.2, Math.min(5, this.targetTransform.k * Math.exp(delta)));
+			
+			const rect = this.canvas.getBoundingClientRect();
+			const mouseX = e.clientX - rect.left;
+			const mouseY = e.clientY - rect.top;
+
+			this.targetTransform.x = mouseX - (mouseX - this.targetTransform.x) * (newScale / this.targetTransform.k);
+			this.targetTransform.y = mouseY - (mouseY - this.targetTransform.y) * (newScale / this.targetTransform.k);
+			this.targetTransform.k = newScale;
+			this.wakeUp();
+		});
+
+		this.canvas.addEventListener('mousedown', (e) => {
+			this.rawDragStartX = e.clientX;
+			this.rawDragStartY = e.clientY;
+			const pos = getMousePos(e);
+			this.draggedNode = null;
+			
+			for (let i = this.nodes.length - 1; i >= 0; i--) {
+				const node = this.nodes[i];
+				const dx = pos.x - node.x;
+				const dy = pos.y - node.y;
+				if (dx * dx + dy * dy <= Math.pow(node.radius + 5, 2)) {
+					this.draggedNode = node;
+					break;
+				}
+			}
+
+			if (this.draggedNode) {
+				this.canvas.style.cursor = 'grabbing';
+				this.wakeUp(); 
+			} else {
+				this.isDragging = true;
+				this.canvas.style.cursor = 'move';
+				this.dragStartX = e.clientX - this.transform.x;
+				this.dragStartY = e.clientY - this.transform.y;
+			}
+		});
+
+		this.canvas.addEventListener('mousemove', (e) => {
+			if (this.draggedNode) {
+				const pos = getMousePos(e);
+				this.draggedNode.x = pos.x;
+				this.draggedNode.y = pos.y;
+				this.wakeUp(); 
+			} else if (this.isDragging) {
+				this.targetTransform.x = e.clientX - this.dragStartX;
+				this.targetTransform.y = e.clientY - this.dragStartY;
+				this.wakeUp();
+			} else {
+				const pos = getMousePos(e);
+				let foundHover = null;
+				for (let i = this.nodes.length - 1; i >= 0; i--) {
+					const node = this.nodes[i];
+					const dx = pos.x - node.x;
+					const dy = pos.y - node.y;
+					if (dx * dx + dy * dy <= Math.pow(node.radius + 3, 2)) {
+						foundHover = node;
+						break;
+					}
+				}
+				
+				if (foundHover !== this.hoveredNode) {
+					this.hoveredNode = foundHover;
+					this.canvas.style.cursor = this.hoveredNode ? 'pointer' : 'grab';
+					this.wakeUp();
+				}
+			}
+		});
+
+		this.canvas.addEventListener('mouseup', (e) => {
+			const dist = Math.abs(e.clientX - this.rawDragStartX) + Math.abs(e.clientY - this.rawDragStartY);
+			if (dist < 5 && (this.draggedNode || this.hoveredNode)) {
+				const targetNode = this.draggedNode || this.hoveredNode;
+				if (!targetNode.isCenter) {
+					const fileToOpen = this.plugin.app.vault.getAbstractFileByPath(targetNode.id);
+					if (fileToOpen instanceof TFile) {
+						this.plugin.app.workspace.getLeaf(false).openFile(fileToOpen);
+					}
+				}
+			}
+			this.isDragging = false;
+			this.draggedNode = null;
+			this.canvas.style.cursor = this.hoveredNode ? 'pointer' : 'grab';
+		});
+
+		this.canvas.addEventListener('mouseleave', () => {
+			this.isDragging = false;
+			this.draggedNode = null;
+			this.hoveredNode = null;
+			this.canvas.style.cursor = 'grab';
+			this.wakeUp();
+		});
+	}
+
+	wakeUp() {
+		if (this.isSleeping || this.energy < 1.0) {
+			this.isSleeping = false;
+			this.stableFrames = 0;
+			this.energy = 1.0;
+		}
+	}
+
+	startSimulation() {
+		const tick = () => {
+			if (!this.canvas.isConnected) return; 
+
+			if (!this.isSleeping) {
+				this.updatePhysics();
+				this.drawGraph();
+			}
+			this.animationFrameId = requestAnimationFrame(tick);
+		};
+		tick();
+	}
+
+	updatePhysics() {
+		this.transform.k += (this.targetTransform.k - this.transform.k) * GRAPH_CONSTANTS.PHYSICS.LERP_SPEED;
+		this.transform.x += (this.targetTransform.x - this.transform.x) * GRAPH_CONSTANTS.PHYSICS.LERP_SPEED;
+		this.transform.y += (this.targetTransform.y - this.transform.y) * GRAPH_CONSTANTS.PHYSICS.LERP_SPEED;
+
+		const repulsion = this.plugin.settings.repulsionForce * 0.5;
+		const springK = this.plugin.settings.linkStrength * 0.5;
+		const springLen = this.plugin.settings.linkDistance * 1.2;
+
+		const currentFriction = GRAPH_CONSTANTS.PHYSICS.FRICTION_IDLE + (GRAPH_CONSTANTS.PHYSICS.FRICTION_ACTIVE - GRAPH_CONSTANTS.PHYSICS.FRICTION_IDLE) * this.energy;
+
+		for (let i = 0; i < this.nodes.length; i++) {
+			const n1 = this.nodes[i];
+			for (let j = i + 1; j < this.nodes.length; j++) {
+				const n2 = this.nodes[j];
+				const dx = n1.x - n2.x;
+				const dy = n1.y - n2.y;
+				let distSq = dx * dx + dy * dy;
+				if (distSq < 100) distSq = 100;
+				
+				const factor = repulsion / distSq;
+				n1.vx += dx * factor; n1.vy += dy * factor;
+				n2.vx -= dx * factor; n2.vy -= dy * factor;
+			}
+		}
+
+		for (const edge of this.edges) {
+			const n1 = this.nodes[edge.sourceIndex];
+			const n2 = this.nodes[edge.targetIndex];
+			const dx = n2.x - n1.x;
+			const dy = n2.y - n1.y;
+			const dist = Math.sqrt(dx * dx + dy * dy);
+			if (dist === 0) continue;
+
+			let force = (dist - springLen) * springK;
+			const fx = (dx / dist) * force;
+			const fy = (dy / dist) * force;
+
+			n1.vx += fx; n1.vy += fy;
+			n2.vx -= fx; n2.vy -= fy;
+		}
+
+		let totalVelocity = 0;
+		for (const node of this.nodes) {
+			if (node.isCenter) {
+				node.x = 0; node.y = 0; node.vx = 0; node.vy = 0;
+				continue;
+			}
+			if (node === this.draggedNode) continue;
+
+			const dist = Math.sqrt(node.x * node.x + node.y * node.y);
+			if (dist > 0) {
+				const grav = 0.01 * dist;
+				node.vx -= (node.x / dist) * grav;
+				node.vy -= (node.y / dist) * grav;
+			}
+
+			node.vx *= currentFriction; 
+			node.vy *= currentFriction;
+
+			if (Math.abs(node.vx) < 0.05) node.vx = 0;
+			if (Math.abs(node.vy) < 0.05) node.vy = 0;
+
+			node.x += node.vx; node.y += node.vy;
+			totalVelocity += Math.abs(node.vx) + Math.abs(node.vy);
+		}
+
+		const averageVelocity = this.nodes.length > 0 ? totalVelocity / this.nodes.length : 0;
+
+		if (averageVelocity < GRAPH_CONSTANTS.PHYSICS.SLEEP_VELOCITY_THRESHOLD) {
+			this.energy *= GRAPH_CONSTANTS.PHYSICS.ENERGY_DECAY;
+			if (this.energy < 0.05) {
+				this.stableFrames++;
+				if (this.stableFrames > 15) {
+					this.isSleeping = true;
+					this.energy = 0;
+					for (const node of this.nodes) {
+						node.vx = 0;
+						node.vy = 0;
+					}
+				}
+			}
+		} else {
+			this.stableFrames = 0;
+			if (this.draggedNode) {
+				this.energy = 1.0;
+			} else {
+				this.energy = Math.min(1.0, this.energy + 0.05);
+			}
+		}
+	}
+
+	drawGraph() {
+		this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+		this.ctx.save();
+		const dpr = window.devicePixelRatio || 1;
+		this.ctx.scale(dpr, dpr); 
+		
+		this.ctx.translate(this.transform.x, this.transform.y);
+		this.ctx.scale(this.transform.k, this.transform.k);
+
+		this.ctx.textAlign = "center";
+		this.ctx.textBaseline = "middle";
+
+		const visFactor = 0.2; 
+
+		// Edges
+		for (const edge of this.edges) {
+			const n1 = this.nodes[edge.sourceIndex];
+			const n2 = this.nodes[edge.targetIndex];
+
+			const isHovered = this.hoveredNode === n1 || this.hoveredNode === n2;
+			edge.hoverProgress = isHovered 
+				? Math.min(1.0, edge.hoverProgress + 0.1) 
+				: Math.max(0.0, edge.hoverProgress - 0.1);
+
+			this.ctx.beginPath();
+			this.ctx.moveTo(n1.x, n1.y);
+			this.ctx.lineTo(n2.x, n2.y);
+			
+			this.ctx.strokeStyle = `rgba(150, 150, 150, ${this.plugin.settings.enableColors ? 0.3 : 0.6})`;
+			this.ctx.lineWidth = this.plugin.settings.linkWidthBase / this.transform.k;
+			this.ctx.stroke();
+
+			if (edge.hoverProgress > 0) {
+				this.ctx.save();
+				this.ctx.globalAlpha = edge.hoverProgress;
+				this.ctx.strokeStyle = "var(--color-purple)"; 
+				this.ctx.lineWidth = this.plugin.settings.linkWidthHover / this.transform.k;
+				this.ctx.stroke();
+				this.ctx.restore();
+			}
+		}
+
+		// Nodes
+		for (const node of this.nodes) {
+			const isHovered = this.hoveredNode === node;
+			let targetRadius = isHovered ? node.radius * 1.2 : node.radius;
+
+			node.visualRadius += (targetRadius - node.visualRadius) * visFactor;
+			node.visualOpacity += ((isHovered || !this.hoveredNode ? 1.0 : 0.4) - node.visualOpacity) * visFactor;
+
+			this.ctx.globalAlpha = node.visualOpacity;
+			this.ctx.beginPath();
+			this.ctx.arc(node.x, node.y, node.visualRadius, 0, 2 * Math.PI, false);
+
+			const activeColor = this.plugin.settings.enableColors ? node.color : GRAPH_CONSTANTS.COLORS.DEFAULT_NODE;
+			
+			if (node.isCenter) {
+				this.ctx.fillStyle = activeColor;
+				this.ctx.fill();
+				
+				if (this.plugin.settings.enableGlow) {
+					this.ctx.save();
+					this.ctx.shadowBlur = 15;
+					this.ctx.shadowColor = activeColor;
+					this.ctx.strokeStyle = "rgba(255,255,255,0.5)";
+					this.ctx.lineWidth = 2 / this.transform.k;
+					this.ctx.stroke();
+					this.ctx.restore();
+				}
+			} else {
+				this.ctx.fillStyle = activeColor;
+				this.ctx.fill();
+			}
+
+			// Text
+			const showText = this.plugin.settings.showAllLabels || isHovered || node.isCenter;
+			node.visualTextOpacity += ((showText ? 1.0 : 0.0) - node.visualTextOpacity) * visFactor;
+
+			if (node.visualTextOpacity > 0.05) {
+				this.ctx.globalAlpha = node.visualTextOpacity * node.visualOpacity;
+				const fontSize = Math.max(this.plugin.settings.fontSizeMin, Math.min(this.plugin.settings.fontSizeMax, node.radius));
+				const yPos = node.y - node.visualRadius - 8;
+
+				this.ctx.fillStyle = (this.plugin.settings.whiteLabels || isHovered) ? "#fff" : "var(--text-normal)";
+				this.ctx.font = `${node.isCenter ? '600' : '300'} ${isHovered ? fontSize * 1.2 : fontSize}px "Inter", sans-serif`;
+				this.ctx.fillText(node.name, node.x, yPos);
+			}
+			this.ctx.globalAlpha = 1.0;
 		}
 
 		this.ctx.restore();

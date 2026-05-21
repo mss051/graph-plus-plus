@@ -1,9 +1,9 @@
 {
-	"id": "smart-graph-grouping",
-	"name": "Smart Graph Grouping",
+	"id": "graph-plus-plus",
+	"name": "Graph Plus Plus",
 	"version": "1.0.0",
 	"minAppVersion": "1.0.0",
-	"description": "Automatically assigns mixed colors to graph nodes based on thematic clusters and network connectivity.",
+	"description": "Enhances Obsidian's graph view with additional features and customization options.",
 	"author": "Tu",
 	"isDesktopOnly": false
 }
